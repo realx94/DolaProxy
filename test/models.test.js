@@ -6,6 +6,8 @@ test("maps API model IDs to Dola modes", () => {
   assert.equal(resolveDolaModel("dola").mode, "Fast");
   assert.equal(resolveDolaModel("dola-fast").mode, "Fast");
   assert.equal(resolveDolaModel("dola-pro").mode, "Pro");
+  assert.equal(resolveDolaModel("dola-image").skill, "image");
+  assert.equal(resolveDolaModel("dola-video").skill, "video");
 });
 
 test("rejects unknown models", () => {

@@ -4,7 +4,9 @@ export function createCompletionId() {
   return `chatcmpl-dola-${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
-export function completionResponse({ id, created, model, text }) {
+export function completionResponse({ id, created, model, text, media = [] }) {
+  const message = { role: "assistant", content: text, refusal: null };
+  if (media.length) message.media = media;
   return {
     id,
     object: "chat.completion",
@@ -12,7 +14,7 @@ export function completionResponse({ id, created, model, text }) {
     model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: text, refusal: null },
+      message,
       logprobs: null,
       finish_reason: "stop",
     }],

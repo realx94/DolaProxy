@@ -2,7 +2,13 @@ import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { CdpConnection } from "./cdp.js";
-import { DolaSseParser, extractDolaError, extractTextDelta } from "./dola-sse.js";
+import {
+  DolaSseParser,
+  extractDolaError,
+  extractEventMeta,
+  extractMediaItems,
+  extractTextDelta,
+} from "./dola-sse.js";
 import { messagesToPrompt } from "./prompt.js";
 
 const BRIDGE_BINDING = "__dolaProxyEmit";
@@ -24,6 +30,13 @@ export class DolaClient {
     return result;
   }
 
+  async inspectConversation(conversationId) {
+    const task = () => this.#inspectConversationLocked(conversationId);
+    const result = this.queue.then(task, task);
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
   async status() {
     try {
       const pages = await this.#getPages();
@@ -36,7 +49,8 @@ export class DolaClient {
   async #generateLocked(messages, onDelta, model, attachments) {
     await this.#ensureConnected();
     await this.#openNewChat();
-    await this.#selectMode(model.mode);
+    if (model.skill) await this.#selectSkill(model.skill);
+    else await this.#selectMode(model.mode);
     if (attachments.length) await this.#attachFiles(attachments);
 
     const jobId = crypto.randomUUID();
@@ -45,6 +59,10 @@ export class DolaClient {
     const response = new Promise((resolve, reject) => {
       const job = {
         text: "",
+        media: new Map(),
+        conversationId: null,
+        messageId: null,
+        videoPending: false,
         onDelta,
         resolve,
         reject,
@@ -210,6 +228,37 @@ export class DolaClient {
     throw new Error(`Dola ${target} model option was not found`);
   }
 
+  async #selectSkill(skill) {
+    const testId = skill === "video" ? "skill_bar_button_17" : "skill_bar_button_3";
+    if (skill === "video") {
+      await this.cdp.send("Runtime.evaluate", {
+        expression: `document.querySelector('[data-testid="skill_bar_button_more"]')?.click()`,
+        returnByValue: true,
+      });
+      await delay(150);
+    }
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const clicked = await this.cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const button = document.querySelector('[data-testid=${JSON.stringify(testId)}]');
+          if (!button) return false;
+          button.click();
+          return true;
+        })()`,
+        returnByValue: true,
+      });
+      if (clicked.result?.value) {
+        await delay(250);
+        await this.#waitForPromptInput();
+        return;
+      }
+      await delay(75);
+    }
+    throw new Error(`Dola ${skill} creation option was not found`);
+  }
+
   async #attachFiles(attachments) {
     const payload = attachments.map(({ name, mimeType, data }) => ({ name, mimeType, data }));
     const result = await this.cdp.send("Runtime.evaluate", {
@@ -253,12 +302,22 @@ export class DolaClient {
 
   async #submitPrompt(prompt, sendTimeoutMs) {
     const setValue = `(() => {
-      const input = document.querySelector('textarea[data-testid="chat_input_input"],textarea[placeholder="Message..."]');
+      const input = document.querySelector('textarea[data-testid="chat_input_input"],textarea[placeholder="Message..."],[contenteditable="true"][data-testid="chat_input_input"],.ProseMirror[contenteditable="true"]');
       if (!input) return false;
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(input, ${JSON.stringify(prompt)});
-      input.dispatchEvent(new Event('input', { bubbles: true }));
       input.focus();
+      if (input instanceof HTMLTextAreaElement) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(input, ${JSON.stringify(prompt)});
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        const transfer = new DataTransfer();
+        transfer.setData('text/plain', ${JSON.stringify(prompt)});
+        input.dispatchEvent(new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: transfer,
+        }));
+      }
       return true;
     })()`;
     const result = await this.cdp.send("Runtime.evaluate", { expression: setValue, returnByValue: true });
@@ -311,6 +370,17 @@ export class DolaClient {
       this.#finishJob(jobId, new Error(error));
       return;
     }
+    const meta = extractEventMeta(event);
+    if (meta.conversationId) job.conversationId = String(meta.conversationId);
+    if (meta.messageId) job.messageId = String(meta.messageId);
+    if (meta.videoPending) job.videoPending = true;
+    for (const media of extractMediaItems(event)) {
+      const key = media.id || media.sourceUrl;
+      const previous = job.media.get(key);
+      if (!previous || media.status === "completed" || previous.status !== "completed") {
+        job.media.set(key, { ...previous, ...media });
+      }
+    }
     const delta = extractTextDelta(event);
     if (!delta) return;
     job.text += delta;
@@ -323,8 +393,124 @@ export class DolaClient {
     this.jobs.delete(jobId);
     clearTimeout(job.timer);
     if (error) job.reject(error);
-    else if (!job.text) job.reject(new Error("Dola returned an empty response"));
-    else job.resolve({ text: job.text });
+    else if (!job.text && !job.media.size && !job.videoPending) job.reject(new Error("Dola returned an empty response"));
+    else job.resolve({
+      text: job.text,
+      media: [...job.media.values()].filter((item) => item.status !== "failed"),
+      conversationId: job.conversationId,
+      messageId: job.messageId,
+      videoPending: job.videoPending,
+    });
+  }
+
+  async #waitForPromptInput() {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const result = await this.cdp.send("Runtime.evaluate", {
+        expression: `Boolean(document.querySelector('textarea[data-testid="chat_input_input"],textarea[placeholder="Message..."],[contenteditable="true"][data-testid="chat_input_input"],.ProseMirror[contenteditable="true"]'))`,
+        returnByValue: true,
+      });
+      if (result.result?.value) return;
+      await delay(100);
+    }
+    throw new Error("Dola creation input did not become ready");
+  }
+
+  async #inspectConversationLocked(conversationId) {
+    if (!conversationId || !/^[\w-]+$/.test(String(conversationId))) {
+      throw new Error("Invalid Dola conversation ID");
+    }
+    await this.#ensureConnected();
+    await this.cdp.send("Runtime.evaluate", {
+      expression: `location.assign(${JSON.stringify(`/chat/${conversationId}`)})`,
+    });
+    const navigationDeadline = Date.now() + 15_000;
+    let navigated = false;
+    while (Date.now() < navigationDeadline) {
+      try {
+        const state = await this.cdp.send("Runtime.evaluate", {
+          expression: `location.href.includes(${JSON.stringify(`/chat/${conversationId}`)}) && Boolean(document.body)`,
+          returnByValue: true,
+        });
+        if (state.result?.value) {
+          navigated = true;
+          break;
+        }
+      } catch {
+        // The JavaScript context is briefly unavailable during navigation.
+      }
+      await delay(100);
+    }
+    if (!navigated) throw new Error("Dola video conversation did not load");
+    // The URL changes before Dola has hydrated the conversation messages.
+    await delay(2_000);
+    await this.#installFetchBridge();
+    const inspectExpression = `(() => {
+        const bodyText = document.body?.innerText || "";
+        const failed = /can't be generated|cannot be generated|generation failed|violate our policies/i.test(bodyText);
+        const nodes = [...document.querySelectorAll('video,video source,a[href]')];
+        const urls = [];
+        for (const node of nodes) {
+          const value = node.currentSrc || node.src || node.href;
+          if (typeof value === 'string' && /^https?:\\/\\//i.test(value) && (/\\.mp4(?:$|[?~])/i.test(value) || node.tagName === 'VIDEO' || node.closest('video'))) {
+            urls.push(value);
+          }
+        }
+        const video = document.querySelector('video');
+        const poster = video?.poster || document.querySelector('[class*="block-video-"] img')?.src || null;
+        return {
+          failed,
+          failureMessage: failed ? bodyText.split('\\n').find((line) => /can't be generated|cannot be generated|generation failed|violate our policies/i.test(line)) || 'Dola video generation failed' : null,
+          urls: [...new Set(urls)],
+          posterUrl: poster,
+          width: video?.videoWidth || null,
+          height: video?.videoHeight || null,
+          duration: Number.isFinite(video?.duration) ? video.duration : null,
+          hasVideoCard: Boolean(document.querySelector('[class*="block-video-"]')),
+        };
+      })()`;
+    let result = await this.cdp.send("Runtime.evaluate", {
+      expression: inspectExpression,
+      returnByValue: true,
+    });
+    if (result.exceptionDetails) throw new Error("Could not inspect the Dola video conversation");
+    let value = result.result?.value || {};
+    if (!value.failed && !value.urls?.length && value.hasVideoCard) {
+      const target = await this.cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          const element = document.querySelector('[class*="play-icon-wrapper-"]') || document.querySelector('[class*="block-video-"]');
+          if (!element) return null;
+          element.scrollIntoView({ block: 'center' });
+          const rect = element.getBoundingClientRect();
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        })()`,
+        returnByValue: true,
+      });
+      if (target.result?.value) {
+        const { x, y } = target.result.value;
+        await this.cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+        await this.cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+        await delay(750);
+        result = await this.cdp.send("Runtime.evaluate", { expression: inspectExpression, returnByValue: true });
+        value = result.result?.value || {};
+      }
+    }
+    if (value.failed) return { status: "failed", error: value.failureMessage };
+    if (!value.urls?.length) return { status: "in_progress", media: [] };
+    return {
+      status: "completed",
+      media: value.urls.map((sourceUrl, index) => ({
+        id: `${conversationId}-${index}`,
+        type: "video",
+        sourceUrl,
+        mimeType: "video/mp4",
+        posterUrl: value.posterUrl,
+        width: value.width,
+        height: value.height,
+        duration: value.duration,
+        status: "completed",
+      })),
+    };
   }
 
   async #getPages() {

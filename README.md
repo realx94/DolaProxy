@@ -10,14 +10,17 @@ The proxy connects to Dola through the Chrome DevTools Protocol (CDP), opens a f
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions` endpoint.
+- OpenAI-style `POST /v1/images/generations` endpoint with URL or base64 output.
+- Asynchronous video jobs through `POST /v1/videos`, polling, and content download.
 - Regular JSON and Server-Sent Events (SSE) streaming responses.
-- Dola Fast and Pro mode selection through API model IDs.
+- Dola Fast, Pro, Create Image, and Create Video selection through API model IDs.
 - Image and document attachments using Dola's native upload control.
 - OpenAI `image_url` content parts, data URLs, base64 data, and remote URLs.
 - Custom `file`, `input_file`, and top-level `attachments` inputs for documents.
 - Optional Bearer API-key authentication.
 - Direct Node.js and Docker Compose deployment.
 - Request serialization because Dola has one active chat UI at a time.
+- Expiring local media URLs that hide Dola's signed CDN URLs and support HTTP Range requests.
 
 ## How it works
 
@@ -124,13 +127,15 @@ Select an **OpenAI Compatible** provider and enter:
 |---|---|---|
 | API Host / Base URL | `http://127.0.0.1:8317/v1` | `http://host.docker.internal:8317/v1` |
 | API Key | The `DOLA_PROXY_API_KEY` value from `.env` | The `DOLA_PROXY_API_KEY` value from `.env` |
-| Model | `dola`, `dola-fast`, or `dola-pro` | `dola`, `dola-fast`, or `dola-pro` |
+| Model | `dola`, `dola-fast`, `dola-pro`, `dola-image`, or `dola-video` | Same |
 
 Replace `8317` when `DOLA_PROXY_PORT` uses a different port. If the UI asks for a complete endpoint instead of a base URL, use:
 
 ```text
 http://127.0.0.1:8317/v1/chat/completions
 ```
+
+9Router uses Chat Completions. `dola-image` therefore returns generated images as Markdown plus structured `message.media` metadata. Use the dedicated Videos API described below when a client needs to create and poll `dola-video` jobs.
 
 ## Models
 
@@ -141,6 +146,8 @@ http://127.0.0.1:8317/v1/chat/completions
 | `dola` | Fast | Default alias. |
 | `dola-fast` | Fast | Dola's general-purpose mode. |
 | `dola-pro` | Pro | Dola's advanced Pro mode. Availability can depend on the signed-in Dola account. |
+| `dola-image` | Create Image | Generates images. Use it with Chat Completions or the Images endpoint. |
+| `dola-video` | Create Video | Starts asynchronous video generation. The Videos endpoint is recommended. |
 
 Unknown model IDs return an OpenAI-style `400 model_not_found` error.
 
@@ -202,6 +209,112 @@ Streaming request:
   ]
 }
 ```
+
+### Generated media in Chat Completions
+
+`dola-image` can be used through Chat Completions when a client only supports that API:
+
+```json
+{
+  "model": "dola-image",
+  "messages": [
+    { "role": "user", "content": "A watercolor lighthouse at sunrise" }
+  ]
+}
+```
+
+The assistant content includes a Markdown media link. The response also includes a Dola Proxy extension at `choices[0].message.media`:
+
+```json
+{
+  "role": "assistant",
+  "content": "![Generated image 1](http://127.0.0.1:8317/v1/media/media_...)",
+  "media": [
+    {
+      "id": "media_...",
+      "type": "image",
+      "url": "http://127.0.0.1:8317/v1/media/media_...",
+      "mime_type": "image/png",
+      "width": 2048,
+      "height": 2048
+    }
+  ]
+}
+```
+
+Streaming Chat Completions emit the same `media` array in a final delta before `finish_reason: "stop"`.
+
+### Image generations
+
+This endpoint follows the URL/base64 conventions of the [OpenAI image generation guide](https://developers.openai.com/api/docs/guides/image-generation).
+
+```http
+POST /v1/images/generations
+Authorization: Bearer <DOLA_PROXY_API_KEY>
+Content-Type: application/json
+```
+
+URL response:
+
+```json
+{
+  "model": "dola-image",
+  "prompt": "A minimal teal circle on a white background, no text",
+  "n": 1,
+  "response_format": "url"
+}
+```
+
+`n` accepts `1` through `4`. Dola normally creates multiple candidates; the proxy returns up to the requested number. Set `response_format` to `b64_json` to receive inline base64 instead of an expiring URL.
+
+### Video generations
+
+Video creation is asynchronous, matching the job, polling, and content-download pattern in the [OpenAI video generation guide](https://developers.openai.com/api/docs/guides/video-generation):
+
+```http
+POST /v1/videos
+Authorization: Bearer <DOLA_PROXY_API_KEY>
+Content-Type: application/json
+```
+
+```json
+{
+  "model": "dola-video",
+  "prompt": "A calm ocean wave reaching an empty beach at sunrise"
+}
+```
+
+The initial response contains a job ID and normally has `status: "in_progress"`:
+
+```json
+{
+  "id": "video_...",
+  "object": "video",
+  "status": "in_progress",
+  "model": "dola-video",
+  "progress": 0
+}
+```
+
+Poll the job until it is `completed` or `failed`:
+
+```http
+GET /v1/videos/video_...
+Authorization: Bearer <DOLA_PROXY_API_KEY>
+```
+
+Download a completed video. This endpoint supports `GET`, `HEAD`, and `Range` requests:
+
+```http
+GET /v1/videos/video_.../content
+Authorization: Bearer <DOLA_PROXY_API_KEY>
+```
+
+Dola usually takes one to three minutes to render a video. A rejected prompt becomes a `failed` job with Dola's moderation message in `error.message`.
+
+### Media URLs
+
+Generated URL responses point to `/v1/media/media_...`, not to Dola's signed CDN. These opaque URLs expire after `DOLA_MEDIA_TTL_MS` and proxy the original MIME type, content length, and byte ranges. They intentionally work without an Authorization header so browsers, Markdown renderers, and HTML media elements can load them. Keep the proxy bound to localhost and treat each media URL as a temporary capability token.
 
 ## File attachments
 
@@ -370,6 +483,8 @@ curl.exe http://127.0.0.1:8317/v1/chat/completions `
 | `DOLA_REQUEST_TIMEOUT_MS` | `360000` | Maximum Dola response time in milliseconds. |
 | `DOLA_MAX_REQUEST_BYTES` | `33554432` | Maximum JSON request size, including base64 data. |
 | `DOLA_MAX_FILE_BYTES` | `20971520` | Maximum decoded size of one attachment. |
+| `DOLA_MEDIA_TTL_MS` | `3600000` | Lifetime of generated media URLs in milliseconds. |
+| `DOLA_MAX_MEDIA_BYTES` | `52428800` | Maximum generated file size that can be buffered for `b64_json`. URL streaming is not buffered. |
 
 ## Compatibility and limitations
 
@@ -377,6 +492,8 @@ Supported:
 
 - Text message content.
 - Dola Fast and Pro modes.
+- Dola image generation with URL and base64 output.
+- Dola asynchronous video jobs, polling, failure reporting, and ranged downloads.
 - Non-streaming and SSE streaming responses.
 - Images and Dola-supported document types.
 - `stream_options.include_usage`, with zero-valued usage fields for client compatibility.
@@ -390,6 +507,8 @@ Not mapped to Dola:
 - Real token usage statistics.
 
 The full OpenAI message history is converted to a labeled transcript and submitted in a fresh Dola chat. Attachments found anywhere in that history are uploaded to the fresh chat. Requests are processed one at a time.
+
+Video jobs and media metadata are kept in memory. Restarting the proxy invalidates existing job IDs and media URLs. Dola may enforce account quotas, model availability, and prompt moderation independently of this proxy.
 
 ## Troubleshooting
 
@@ -442,6 +561,8 @@ npm test
 
 The unit tests use Node.js's built-in test runner and do not require a live Dola session.
 
+The test suite covers attachments, model routing, SSE text and creation blocks, media deduplication and limits, authentication, URL/base64 images, regular and streaming Chat Completions media, asynchronous video completion and failure, HTTP Range, and content download.
+
 ## Security
 
 - Docker publishes the API only on `127.0.0.1` by default.
@@ -450,6 +571,7 @@ The unit tests use Node.js's built-in test runner and do not require a live Dola
 - Do not expose DevTools port `9229` or this proxy directly to the Internet.
 - Remote attachment URLs are downloaded by the proxy; only send URLs you trust.
 - Any client that can call this API can use the signed-in Dola session.
+- Generated `/v1/media/...` URLs do not require the Bearer key; they are random, temporary capability URLs.
 
 ## Project structure
 
@@ -466,6 +588,7 @@ The unit tests use Node.js's built-in test runner and do not require a live Dola
 |   |-- config.js
 |   |-- dola-client.js
 |   |-- dola-sse.js
+|   |-- media-store.js
 |   |-- models.js
 |   |-- openai.js
 |   |-- prompt.js

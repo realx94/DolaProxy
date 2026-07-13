@@ -29,6 +29,8 @@ export function getConfig() {
     requestTimeoutMs: numberFromEnv("DOLA_REQUEST_TIMEOUT_MS", 360_000),
     maxRequestBytes: numberFromEnv("DOLA_MAX_REQUEST_BYTES", 32 * 1024 * 1024),
     maxFileBytes: numberFromEnv("DOLA_MAX_FILE_BYTES", 20 * 1024 * 1024),
+    mediaTtlMs: numberFromEnv("DOLA_MEDIA_TTL_MS", 60 * 60_000),
+    maxMediaBytes: numberFromEnv("DOLA_MAX_MEDIA_BYTES", 50 * 1024 * 1024),
   };
 }
 
