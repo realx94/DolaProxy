@@ -1,0 +1,18 @@
+{
+  "name": "dola-openai-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible HTTP proxy backed by the local Dola desktop app",
+  "scripts": {
+    "dola": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-dola.ps1 -Restart",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f dola-proxy",
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

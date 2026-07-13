@@ -1,0 +1,29 @@
+services:
+  dola-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dola-openai-proxy
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      DOLA_DEBUG_URL: http://host.docker.internal:${DOLA_DEBUG_PORT:-9229}
+      DOLA_REQUEST_TIMEOUT_MS: ${DOLA_REQUEST_TIMEOUT_MS:-360000}
+      DOLA_MAX_REQUEST_BYTES: ${DOLA_MAX_REQUEST_BYTES:-33554432}
+      DOLA_MAX_FILE_BYTES: ${DOLA_MAX_FILE_BYTES:-20971520}
+      DOLA_PROXY_API_KEY: ${DOLA_PROXY_API_KEY:-change-me}
+    ports:
+      - "127.0.0.1:${DOLA_PROXY_PORT:-8317}:3000"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
