@@ -1,6 +1,14 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { collectAttachments } from "./attachments.js";
+import {
+  anthropicError,
+  anthropicResponse,
+  anthropicUsage,
+  createMessageId,
+  messagesToAnthropicPrompt,
+  parseAnthropicOutput,
+} from "./anthropic.js";
 import { getConfig } from "./config.js";
 import { DolaClient } from "./dola-client.js";
 import { MediaStore } from "./media-store.js";
@@ -42,6 +50,9 @@ export function createServer(client = dola, settings = config, state = {}) {
       }
 
       if (!isAuthorized(request, settings.apiKey)) {
+        if (isAnthropicPath(url.pathname)) {
+          return sendJson(response, 401, anthropicError("Invalid API key", "authentication_error"));
+        }
         return sendJson(response, 401, openAiError("Invalid API key", {
           type: "authentication_error",
           code: "invalid_api_key",
@@ -63,6 +74,14 @@ export function createServer(client = dola, settings = config, state = {}) {
 
       if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
         return await handleChatCompletion(request, response, client, settings, mediaStore);
+      }
+
+      if (url.pathname === "/v1/messages" && request.method === "POST") {
+        return await handleAnthropicMessages(request, response, client, settings);
+      }
+
+      if (url.pathname === "/v1/messages/count_tokens" && request.method === "POST") {
+        return await handleAnthropicTokenCount(request, response, settings);
       }
 
       if (url.pathname === "/v1/images/generations" && request.method === "POST") {
@@ -112,11 +131,20 @@ export function createServer(client = dola, settings = config, state = {}) {
     } catch (error) {
       if (response.headersSent) {
         if (!response.writableEnded) {
-          writeSse(response, openAiError(error.message, { type: "api_error" }));
-          response.write("data: [DONE]\n\n");
+          if (isAnthropicPath(url.pathname)) {
+            writeAnthropicSse(response, "error", anthropicError(error.message));
+          } else {
+            writeSse(response, openAiError(error.message, { type: "api_error" }));
+            response.write("data: [DONE]\n\n");
+          }
           response.end();
         }
         return;
+      }
+      if (isAnthropicPath(url.pathname)) {
+        return sendJson(response, error.statusCode || 502, anthropicError(error.message,
+          error.statusCode === 401 ? "authentication_error" : error.statusCode && error.statusCode < 500
+            ? "invalid_request_error" : "api_error"));
       }
       sendJson(response, error.statusCode || 502, openAiError(error.message, {
         type: error.statusCode && error.statusCode < 500 ? "invalid_request_error" : "api_error",
@@ -124,6 +152,138 @@ export function createServer(client = dola, settings = config, state = {}) {
       }));
     }
   });
+}
+
+async function handleAnthropicTokenCount(request, response, settings) {
+  const body = await readJson(request, settings.maxRequestBytes);
+  if (!Array.isArray(body.messages)) {
+    throw httpError(400, "messages must be an array", "invalid_messages");
+  }
+  const prompt = messagesToAnthropicPrompt(body);
+  // Dola does not expose its tokenizer. This estimate is sufficient for Claude Code's
+  // context budgeting and deliberately errs slightly high for non-ASCII input.
+  const bytes = Buffer.byteLength(prompt, "utf8");
+  return sendJson(response, 200, { input_tokens: Math.max(1, Math.ceil(bytes / 3.5)) });
+}
+
+function isAnthropicPath(pathname) {
+  return pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens";
+}
+
+async function handleAnthropicMessages(request, response, client, settings) {
+  const body = await readJson(request, settings.maxRequestBytes);
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    throw httpError(400, "messages must be a non-empty array", "invalid_messages");
+  }
+  if (body.max_tokens === undefined) {
+    throw httpError(400, "max_tokens is required", "invalid_max_tokens");
+  }
+  const requestedModel = typeof body.model === "string" && body.model ? body.model : "dola";
+  const selectedModel = resolveAnthropicModel(requestedModel);
+  const attachments = await collectAttachments(body.messages, [], {
+    maxFileBytes: settings.maxFileBytes,
+    maxTotalBytes: settings.maxRequestBytes,
+  });
+  const prompt = messagesToAnthropicPrompt(body);
+  const generateMessages = [{ role: "user", content: prompt }];
+  const id = createMessageId();
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice?.type !== "none";
+
+  if (!body.stream) {
+    const result = await client.generate(generateMessages, { model: selectedModel, attachments });
+    const parsed = parseAnthropicOutput(result.text, body.tools);
+    return sendJson(response, 200, anthropicResponse({ id, model: requestedModel, ...parsed }));
+  }
+
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  writeAnthropicSse(response, "message_start", {
+    type: "message_start",
+    message: {
+      id,
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: requestedModel,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: anthropicUsage(),
+    },
+  });
+
+  if (hasTools) {
+    // Buffer tool-capable responses so private tool markup is never leaked as text deltas.
+    const result = await client.generate(generateMessages, { model: selectedModel, attachments });
+    const parsed = parseAnthropicOutput(result.text, body.tools);
+    writeAnthropicBlocks(response, parsed.blocks);
+    finishAnthropicStream(response, parsed.stopReason);
+    return;
+  }
+
+  let started = false;
+  const startText = () => {
+    if (started) return;
+    started = true;
+    writeAnthropicSse(response, "content_block_start", {
+      type: "content_block_start", index: 0, content_block: { type: "text", text: "" },
+    });
+  };
+  await client.generate(generateMessages, {
+    model: selectedModel,
+    attachments,
+    onDelta: (text) => {
+      startText();
+      writeAnthropicSse(response, "content_block_delta", {
+        type: "content_block_delta", index: 0, delta: { type: "text_delta", text },
+      });
+    },
+  });
+  startText();
+  writeAnthropicSse(response, "content_block_stop", { type: "content_block_stop", index: 0 });
+  finishAnthropicStream(response, "end_turn");
+}
+
+function resolveAnthropicModel(model) {
+  if (String(model).toLowerCase().startsWith("dola")) return resolveDolaModel(model);
+  const normalized = String(model).toLowerCase();
+  return resolveDolaModel(normalized.includes("haiku") ? "dola-fast" : "dola-pro");
+}
+
+function writeAnthropicBlocks(response, blocks) {
+  blocks.forEach((block, index) => {
+    if (block.type === "tool_use") {
+      writeAnthropicSse(response, "content_block_start", {
+        type: "content_block_start", index,
+        content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+      });
+      writeAnthropicSse(response, "content_block_delta", {
+        type: "content_block_delta", index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+      });
+    } else {
+      writeAnthropicSse(response, "content_block_start", {
+        type: "content_block_start", index, content_block: { type: "text", text: "" },
+      });
+      if (block.text) writeAnthropicSse(response, "content_block_delta", {
+        type: "content_block_delta", index, delta: { type: "text_delta", text: block.text },
+      });
+    }
+    writeAnthropicSse(response, "content_block_stop", { type: "content_block_stop", index });
+  });
+}
+
+function finishAnthropicStream(response, stopReason) {
+  writeAnthropicSse(response, "message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: 0 },
+  });
+  writeAnthropicSse(response, "message_stop", { type: "message_stop" });
+  response.end();
 }
 
 async function handleChatCompletion(request, response, client, settings, mediaStore) {
@@ -319,7 +479,7 @@ async function readJson(request, maxBytes = 10 * 1024 * 1024) {
 
 function isAuthorized(request, apiKey) {
   if (!apiKey) return true;
-  return request.headers.authorization === `Bearer ${apiKey}`;
+  return request.headers.authorization === `Bearer ${apiKey}` || request.headers["x-api-key"] === apiKey;
 }
 
 function sendJson(response, status, body) {
@@ -335,9 +495,13 @@ function writeSse(response, value) {
   if (!response.writableEnded) response.write(`data: ${JSON.stringify(value)}\n\n`);
 }
 
+function writeAnthropicSse(response, event, value) {
+  if (!response.writableEnded) response.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
+}
+
 function setCommonHeaders(response) {
   response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
+  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, X-Api-Key, Anthropic-Version, Anthropic-Beta");
   response.setHeader("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range");
   response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
 }
@@ -351,5 +515,6 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].rep
   server.listen(config.port, config.host, () => {
     console.log(`Dola OpenAI proxy listening at http://${config.host}:${config.port}`);
     console.log(`OpenAI base URL: http://${config.host}:${config.port}/v1`);
+    console.log(`Anthropic base URL: http://${config.host}:${config.port}`);
   });
 }

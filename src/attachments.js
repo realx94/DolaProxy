@@ -91,6 +91,24 @@ function contentPartToSpec(part, index) {
     };
   }
 
+  if (part.type === "image" || part.type === "document") {
+    const source = part.source || {};
+    let value;
+    if (source.type === "base64" && source.data) {
+      value = `data:${source.media_type || "application/octet-stream"};base64,${source.data}`;
+    } else if (source.type === "url" && source.url) {
+      value = source.url;
+    } else {
+      // Claude Code may send non-uploadable document references; keep those in the prompt only.
+      return null;
+    }
+    return {
+      source: value,
+      filename: part.title || filenameFromUrl(value) || `${part.type}-${index}`,
+      mimeType: source.media_type || null,
+    };
+  }
+
   return null;
 }
 

@@ -188,12 +188,17 @@ export class DolaClient {
     const target = mode === "Pro" ? "Pro" : "Fast";
     const openResult = await this.cdp.send("Runtime.evaluate", {
       expression: `(() => {
-        const root = document.querySelector('[data-testid="deep-thinking-action-button"]');
+        const root = document.querySelector('[data-valid-btn="mode-select-action-btn"]');
         if (!root) return { error: "Dola model selector was not found" };
-        const current = (root.innerText || "").trim().split("\\n")[0];
-        if (current === ${JSON.stringify(target)}) return { selected: true };
         const trigger = root.parentElement?.closest('button');
         if (!trigger) return { error: "Dola model selector trigger was not found" };
+        // root also contains the (hidden until opened) dropdown menu content
+        // in the DOM, so root.innerText mixes both menu options together.
+        // Only the trigger button's own direct label reflects what is
+        // currently selected.
+        const visibleLabel = root.querySelector(':scope > button');
+        const current = ((visibleLabel || trigger).innerText || "").trim().split("\\n")[0];
+        if (current === ${JSON.stringify(target)}) return { selected: true };
         trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }));
         trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
         trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));

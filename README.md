@@ -1,6 +1,6 @@
-# Dola OpenAI Proxy
+# Dola OpenAI and Claude Code Proxy
 
-A local HTTP proxy that exposes the signed-in Dola Desktop app through an OpenAI-compatible Chat Completions API.
+A local HTTP proxy that exposes the signed-in Dola Desktop app through OpenAI-compatible APIs and the Anthropic Messages API used by Claude Code.
 
 The proxy connects to Dola through the Chrome DevTools Protocol (CDP), opens a fresh chat, selects the requested Dola mode, attaches files, submits the prompt, and streams Dola's response back to the client. Dola continues to manage its own cookies, `msToken`, and anti-bot signatures; this project does not extract or store Dola login credentials.
 
@@ -10,6 +10,8 @@ The proxy connects to Dola through the Chrome DevTools Protocol (CDP), opens a f
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions` endpoint.
+- Anthropic-compatible `POST /v1/messages` endpoint for Claude Code, including client tool calls and SSE streaming.
+- Anthropic-compatible `POST /v1/messages/count_tokens` estimate for Claude Code context budgeting.
 - OpenAI-style `POST /v1/images/generations` endpoint with URL or base64 output.
 - Asynchronous video jobs through `POST /v1/videos`, polling, and content download.
 - Regular JSON and Server-Sent Events (SSE) streaming responses.
@@ -17,7 +19,7 @@ The proxy connects to Dola through the Chrome DevTools Protocol (CDP), opens a f
 - Image and document attachments using Dola's native upload control.
 - OpenAI `image_url` content parts, data URLs, base64 data, and remote URLs.
 - Custom `file`, `input_file`, and top-level `attachments` inputs for documents.
-- Optional Bearer API-key authentication.
+- Optional Bearer or `x-api-key` authentication.
 - Direct Node.js and Docker Compose deployment.
 - Request serialization because Dola has one active chat UI at a time.
 - Expiring local media URLs that hide Dola's signed CDN URLs and support HTTP Range requests.
@@ -25,7 +27,7 @@ The proxy connects to Dola through the Chrome DevTools Protocol (CDP), opens a f
 ## How it works
 
 ```text
-OpenAI client / 9Router
+OpenAI client / 9Router / Claude Code
           |
           | HTTP /v1/chat/completions
           v
@@ -136,6 +138,37 @@ http://127.0.0.1:8317/v1/chat/completions
 ```
 
 9Router uses Chat Completions. `dola-image` therefore returns generated images as Markdown plus structured `message.media` metadata. Use the dedicated Videos API described below when a client needs to create and poll `dola-video` jobs.
+
+## Claude Code configuration
+
+Claude Code must use the proxy root URL (without `/v1`). In PowerShell, configure the current terminal and then start Claude Code:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:8317'
+$env:ANTHROPIC_AUTH_TOKEN = 'your-api-key'
+$env:ANTHROPIC_MODEL = 'dola-pro'
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL = 'dola-pro'
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL = 'dola-pro'
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'dola-fast'
+claude
+```
+
+The same values can be placed in Claude Code's `settings.json`:
+
+```json
+{
+  "model": "dola-pro",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "dola-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "dola-pro",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "dola-fast"
+  }
+}
+```
+
+Claude Code sends its tools in the Anthropic `tools` field. The proxy teaches Dola a private tool-call envelope, converts valid calls into `tool_use` content blocks, and accepts Claude Code's `tool_result` blocks on the next request. Tool execution and permission prompts remain inside Claude Code.
 
 ## Models
 
@@ -497,14 +530,17 @@ Supported:
 - Non-streaming and SSE streaming responses.
 - Images and Dola-supported document types.
 - `stream_options.include_usage`, with zero-valued usage fields for client compatibility.
+- Anthropic Messages JSON/SSE responses, `system` blocks, `tool_use`, and `tool_result` for Claude Code.
 
-Not mapped to Dola:
+Not mapped to the OpenAI Chat Completions endpoint:
 
 - Tool or function calling.
 - Audio input/output.
 - `logprobs`.
 - Sampling controls such as `temperature`, `top_p`, and `seed`.
 - Real token usage statistics.
+
+Anthropic token counts are estimates because Dola does not expose tokenizer or usage data. Tool calls are prompt-driven rather than grammar-constrained, so malformed tool markup is returned as ordinary text instead of being executed. Dola's single desktop chat still serializes Claude Code requests, including subagent requests.
 
 The full OpenAI message history is converted to a labeled transcript and submitted in a fresh Dola chat. Attachments found anywhere in that history are uploaded to the fresh chat. Requests are processed one at a time.
 
